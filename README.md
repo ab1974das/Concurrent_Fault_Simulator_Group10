@@ -5,31 +5,35 @@ This project implements a concurrent fault simulator for structural Verilog circ
 It supports:
 
 Parsing structural Verilog netlists
-Reading test vectors from CSV
-Topological sorting of circuit elements
-Fault-free simulation
-Single stuck-at fault generation & collapsing
-Multi-vector, multi-timeframe serial fault simulation
-Fault coverage reporting
+Reading test vectors from CSV,
+Topological sorting of circuit elements,
+Fault-free simulation,
+Single stuck-at fault generation & collapsing,
+Multi-vector, multi-timeframe serial fault simulation,
+Fault coverage reporting,
 Full PyQt6 GUI for interactive use
 
 Features
-✔ Structural Verilog Parsing
+✔ Structural Verilog Parsing:
 Extracts inputs, outputs, wires, and gates
 Supports common gate types: AND, OR, NAND, NOR, XOR, XNOR, BUF, NOT
 
-✔ Test Vector Loader
+✔ Test Vector Loader:
 Reads binary vectors from CSV
 Automatically validates and aligns with primary inputs
 
-✔ Logic Simulation Engine
-Multi-level combinational evaluation
-Supports 5-valued logic including D (1/0) and B (0/1)
+✔ Logic Simulation Engine:
+Simulates the circuit’s normal operation (without faults).
+Evaluates gate outputs level by level for all test vectors.
+Stores reference (golden) results for comparison.
+Returns results (list of net_vals dict per vector) and dff_states (final DFF states).
 
-✔ Fault Model
+
+
+✔ Fault Model:
 Detects all Single stuck-at faults (SA0 / SA1)
-
 Fault collapsing (equivalence + dominance)
+
 ✔ Serial Fault Simulation
 Simulates each fault sequentially over all vectors
 Detects first vector and logic level that reveals a fault
@@ -45,7 +49,6 @@ Automatically writes to result file
 ✔ PyQt6 GUI
 
 Load Verilog file
-
 Load test vectors
 
 Run simulation in background thread
@@ -75,7 +78,6 @@ Usage (GUI)
 Run the application:
 python fault_simulation_gui.py
 
-
 In the GUI:
 
 Click Load Verilog File → choose structural netlist
@@ -95,8 +97,6 @@ X	Unknown
 D	Faulty 1 (fault-free=1, fault=0)
 B	Faulty 0 (fault-free=0, fault=1)
 
-This model enables fault activation + propagation detection.
-
 Stages of the Simulation
 
 Stage 1 – Verilog Parsing
@@ -113,8 +113,7 @@ Stage 6 – Serial Fault Simulation
 
 Stage 7 – Reporting & Output Generation
 
-Output Files
-
+Output Files:
 A result text file is automatically generated containing:
 
 Circuit details
@@ -150,11 +149,4 @@ Future Improvements
 To be able to generate Test coverage and fault statistics for all Sequential circuits . (Here only an approach is mentioned using D flip-flops as gates)
 To make this program event driven
 
-
-VCD waveform output
-
-Transition fault model
-
-License
-
-This project is free for educational and research use.
+License: This project is free for educational and research use.
