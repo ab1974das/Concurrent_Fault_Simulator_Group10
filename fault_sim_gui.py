@@ -11,10 +11,6 @@
 # Requirements:
 #   - Python 3.8+
 #   - PyQt6
-#
-# The original simulation code was kept intact and only minimal changes were made:
-#  - write_results_to_file now appends to "Result.txt" instead of overwriting.
-#  - Added GUI, stdout redirection to GUI console, run/stop threading behavior.
 
 import re
 import csv
@@ -329,27 +325,46 @@ def collapse_faults_dominance(circuit, eq_faults):
     removed = set()
     dom_map = []
     def sa(n,v): return f"{n}/SA{v}"
+    # NOTE: a dominating fault (e.g. a gate-output SA1 on an AND gate) may
+    # only be dropped if at least one of its dominating "witness" faults
+    # (e.g. an input SA1 on that same gate) is still present in the fault
+    # set under its own name. If equivalence collapsing already folded that
+    # witness into some other net's fault, there is nothing left in the
+    # simulated list whose detection is guaranteed to imply detection of
+    # the output fault -- so it must NOT be removed in that case.
     for g in circuit['gates']:
         t = g['type'].lower()
         ins, y = g['inputs'], g['output']
         if t == 'and' and sa(y,1) in fault_set:
-            dom_map.append((sa(y,1), [sa(a,1) for a in ins if sa(a,1) in fault_set]))
-            removed.add(sa(y,1))
+            witnesses = [sa(a,1) for a in ins if sa(a,1) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,1), witnesses))
+                removed.add(sa(y,1))
         elif t == 'nand' and sa(y,0) in fault_set:
-            dom_map.append((sa(y,0), [sa(a,1) for a in ins if sa(a,1) in fault_set]))
-            removed.add(sa(y,0))
+            witnesses = [sa(a,1) for a in ins if sa(a,1) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,0), witnesses))
+                removed.add(sa(y,0))
         elif t == 'or' and sa(y,0) in fault_set:
-            dom_map.append((sa(y,0), [sa(a,0) for a in ins if sa(a,0) in fault_set]))
-            removed.add(sa(y,0))
+            witnesses = [sa(a,0) for a in ins if sa(a,0) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,0), witnesses))
+                removed.add(sa(y,0))
         elif t == 'nor' and sa(y,1) in fault_set:
-            dom_map.append((sa(y,1), [sa(a,0) for a in ins if sa(a,0) in fault_set]))
-            removed.add(sa(y,1))
+            witnesses = [sa(a,0) for a in ins if sa(a,0) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,1), witnesses))
+                removed.add(sa(y,1))
         elif t == 'xor' and sa(y,1) in fault_set:
-            dom_map.append((sa(y,1), [sa(a,1) for a in ins if sa(a,1) in fault_set]))
-            removed.add(sa(y,1))
+            witnesses = [sa(a,1) for a in ins if sa(a,1) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,1), witnesses))
+                removed.add(sa(y,1))
         elif t == 'xnor' and sa(y,0) in fault_set:
-            dom_map.append((sa(y,0), [sa(a,1) for a in ins if sa(a,1) in fault_set]))
-            removed.add(sa(y,0))
+            witnesses = [sa(a,1) for a in ins if sa(a,1) in fault_set]
+            if witnesses:
+                dom_map.append((sa(y,0), witnesses))
+                removed.add(sa(y,0))
     collapsed_final = sorted(f for f in fault_set if f not in removed)
     print("\nSTAGE 5C: DOMINANCE COLLAPSING")
     print(f"Before dominance: {len(eq_faults)} faults")
@@ -368,281 +383,699 @@ def generate_and_collapse_faults(circuit):
     print(f"Full fault count       : {len(full)}")
     print(f"After equivalence      : {len(eq_collapsed)}")
     print(f"After dominance        : {len(dom_collapsed)}")
+    print(f"Faults that will actually be simulated in Stage 6: {len(dom_collapsed)} "
+          f"(reduced from {len(full)} full faults, "
+          f"{100.0 * (len(full) - len(dom_collapsed)) / len(full):.1f}% reduction)" if full else "")
     return {'full': full, 'eq_collapsed': eq_collapsed, 'dom_collapsed': dom_collapsed, 'eq_map': eq_map, 'dom_map': dom_map}
+
+# ----------------------
+# STEP 6b: EXPAND COLLAPSED-LIST RESULTS BACK TO THE FULL FAULT LIST
+# ----------------------
+
+def expand_coverage_to_full_list(faults_info, detection_map):
+    """
+    Map Stage 6 detection results (computed only on the collapsed fault
+    list) back onto the FULL, uncollapsed fault list, so a full-list
+    coverage number can be reported alongside the standard collapsed-fault
+    coverage.
+
+    - Equivalence-collapsed faults are PROVABLY co-detected with their
+      representative, in both directions (that's what equivalence means).
+      So each removed fault inherits its representative's detected /
+      undetected status exactly -- no approximation here.
+
+    - Dominance-collapsed faults are only guaranteed in ONE direction: any
+      test that detects the dominated "witness" fault is guaranteed to
+      also detect the dominating fault that was removed. The converse is
+      NOT guaranteed -- if the witness wasn't detected by the applied
+      vectors, the dominating fault might still be detectable by some
+      other vector we didn't simulate, but we can't claim that without
+      actually simulating it. So here it is conservatively marked
+      undetected. This makes the expanded full-list number a safe LOWER
+      BOUND on true full-list coverage, not necessarily an exact count --
+      the same convention ATPG tools use when back-annotating collapsed
+      results.
+    """
+    # Equivalence collapsing is a single forward sweep over the gate list
+    # (see collapse_faults_equivalence), not a transitive closure -- so a
+    # fault that is used as a "representative" for one grouping can itself
+    # get folded into a DIFFERENT representative by a later grouping in the
+    # same pass (e.g. a NOT gate's fault keeps some net as representative,
+    # but an AND/OR gate downstream later folds that same net's fault into
+    # yet another representative). A naive single pass over eq_map in
+    # insertion order resolves these chains incorrectly. Union-Find over
+    # every fault name that appears anywhere in eq_map gives the correct
+    # equivalence classes regardless of chain order.
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for rep, folded in faults_info['eq_map']:
+        for f in folded:
+            union(rep, f)
+
+    # Ground truth: the faults actually simulated (dom_collapsed).
+    known_detected = set(f for f, d in detection_map.items() if d['detected'])
+    known_undetected = set(f for f, d in detection_map.items() if not d['detected'])
+
+    # Dominance: removed (dominating) fault <- [dominated witness fault(s)].
+    # Guaranteed only in the direction "witness detected => dominating
+    # fault detected" (see collapse_faults_dominance docstring/comments).
+    # If no witness was detected, conservatively mark undetected -- this is
+    # what makes the expanded number a safe LOWER BOUND rather than exact.
+    for removed, witnesses in faults_info['dom_map']:
+        if any(w in known_detected for w in witnesses):
+            known_detected.add(removed)
+        else:
+            known_undetected.add(removed)
+
+    # An equivalence class is DETECTED if ANY member's status is known and
+    # detected (equivalent faults are guaranteed to be co-detected, so one
+    # detected member proves the whole class is); otherwise UNDETECTED if
+    # any member's status is known and undetected.
+    class_detected = {}
+    for f in known_detected:
+        class_detected[find(f)] = True
+    for f in known_undetected:
+        class_detected.setdefault(find(f), False)
+
+    full_detected = set()
+    full_undetected = set()
+    for f in faults_info['full']:
+        (full_detected if class_detected.get(find(f), False) else full_undetected).add(f)
+
+    return full_detected, full_undetected
 
 # ----------------------
 # STEP 6: TIME-EXPANDED SEQUENTIAL FAULT SIM (5-valued)
 # ----------------------
+def fault_simulation_concurrent(fault_list_to_simulate, circuit, sorted_gates,
+                                fault_free_results_binary, test_vectors,
+                                verbose_sample=10):
+    """
+    Concurrent stuck-at fault simulation using per-net concurrent fault lists.
 
-def fault_simulation_serial(full_fault_list, circuit, sorted_gates, fault_free_results_binary, test_vectors, verbose_sample=10):
+    IMPORTANT: fault_list_to_simulate should be the COLLAPSED fault list
+    (faults_info['dom_collapsed']) rather than the full fault list. Every
+    fault that equivalence/dominance collapsing removed is guaranteed to be
+    detected by exactly the same set of test vectors as the representative
+    fault it collapsed into, so simulating the full list wastes time without
+    changing the result set (once you fold the collapsed faults back in for
+    reporting, if you need per-fault statistics for the full list).
+
+    For each test vector:
+        1. Simulate the good circuit once.
+        2. Maintain a concurrent fault list at every net.
+        3. Propagate all active faults through the circuit.
+        4. Detect faults appearing at primary outputs.
+        5. Update faulty DFF states for the next vector.
+    """
+
+    VAL0, VAL1, VALX, VALD, VALB = '0', '1', 'X', 'D', 'B'
+
     def parse_fault(fstr):
         net, sa = fstr.split('/SA')
         return net, int(sa)
 
-    VAL0, VAL1, VALX, VALD, VALB = '0','1','X','D','B'
-
-    def combine_db(a, b):
-        if a == VALX or b == VALX:
-            return VALX
-        if a == VALD and b == VALD:
-            return VALD
-        if a == VALB and b == VALB:
-            return VALB
-        if (a == VALD and b == VALB) or (a == VALB and b == VALD):
-            return VALX
-        if a in (VALD, VALB): return a
-        if b in (VALD, VALB): return b
-        return VALX
-
-    def eval_gate_5val(gtype, in_vals):
+    # ------------------------------------------------------------
+    # 5-valued gate evaluation
+    # D = good 1, faulty 0
+    # B = good 0, faulty 1
+    # ------------------------------------------------------------
+    def eval_gate_5val(gtype, vals):
         g = gtype.lower()
-        has0 = any(v == VAL0 for v in in_vals)
-        has1 = any(v == VAL1 for v in in_vals)
-        hasX = any(v == VALX for v in in_vals)
-        hasD = any(v == VALD for v in in_vals)
-        hasB = any(v == VALB for v in in_vals)
-
-        if g == 'and':
-            if has0: return VAL0
-            if hasD or hasB:
-                # combine DB signals if present
-                dpart = VALD if hasD else VAL0
-                bpart = VALB if hasB else VAL0
-                comb = combine_db(dpart, bpart)
-                return comb if comb in (VALD, VALB) else VAL1
-            if hasX: return VALX
-            return VAL1
-
-        if g == 'or':
-            if has1: return VAL1
-            if hasD or hasB:
-                dpart = VALD if hasD else VAL0
-                bpart = VALB if hasB else VAL0
-                comb = combine_db(dpart, bpart)
-                return comb if comb in (VALD, VALB) else VAL0
-            if hasX: return VALX
-            return VAL0
 
         if g == 'not':
-            v = in_vals[0] if in_vals else VALX
-            if v == VAL0: return VAL1
-            if v == VAL1: return VAL0
-            if v == VALD: return VALB
-            if v == VALB: return VALD
+            return {
+                VAL0: VAL1,
+                VAL1: VAL0,
+                VALD: VALB,
+                VALB: VALD
+            }.get(vals[0], VALX)
+
+        if any(v == VALX for v in vals):
             return VALX
 
-        if g == 'nand':
-            a = eval_gate_5val('and', in_vals)
-            return eval_gate_5val('not', [a])
+        good = []
+        faulty = []
 
-        if g == 'nor':
-            a = eval_gate_5val('or', in_vals)
-            return eval_gate_5val('not', [a])
+        for v in vals:
+            if v == VALD:
+                good.append(1)
+                faulty.append(0)
 
-        if g == 'xor':
-            if hasX: return VALX
-            good_parity = 0
-            bad_parity = 0
-            for v in in_vals:
-                if v == VAL1:
-                    good_parity ^= 1; bad_parity ^= 1
-                elif v == VAL0:
-                    pass
-                elif v == VALD:
-                    good_parity ^= 1; bad_parity ^= 0
-                elif v == VALB:
-                    good_parity ^= 0; bad_parity ^= 1
-                else:
-                    return VALX
-            if good_parity == bad_parity:
-                return VAL1 if good_parity == 1 else VAL0
-            if good_parity == 1 and bad_parity == 0:
-                return VALD
-            if good_parity == 0 and bad_parity == 1:
-                return VALB
-            return VALX
+            elif v == VALB:
+                good.append(0)
+                faulty.append(1)
 
-        if g == 'xnor':
-            x = eval_gate_5val('xor', in_vals)
-            return eval_gate_5val('not', [x])
+            else:
+                b = 1 if v == VAL1 else 0
+                good.append(b)
+                faulty.append(b)
 
-        return VALX
+        def evaluate(bits):
+            if g == 'and':
+                return int(all(bits))
 
-    driver = {g['output']: g for g in circuit['gates']}
-    fanout = {}
-    for g in circuit['gates']:
-        for inp in g['inputs']:
-            fanout.setdefault(inp, []).append(g)
+            if g == 'or':
+                return int(any(bits))
 
-    total_faults = len(full_fault_list)
+            if g == 'nand':
+                return int(not all(bits))
+
+            if g == 'nor':
+                return int(not any(bits))
+
+            if g == 'xor':
+                result = 0
+                for b in bits:
+                    result ^= b
+                return result
+
+            if g == 'xnor':
+                result = 0
+                for b in bits:
+                    result ^= b
+                return int(not result)
+
+            return None
+
+        good_value = evaluate(good)
+        faulty_value = evaluate(faulty)
+
+        if good_value == faulty_value:
+            return VAL1 if good_value else VAL0
+
+        if good_value == 1 and faulty_value == 0:
+            return VALD
+
+        return VALB
+
+    # ------------------------------------------------------------
+    # DFF information
+    # ------------------------------------------------------------
+    dff_gates = [
+        g for g in circuit['gates']
+        if g['type'].lower() == 'dff'
+    ]
+
+    dff_outputs = [g['output'] for g in dff_gates]
+
+    # Good DFF states
+    good_dff_states = {
+        q: 0 for q in dff_outputs
+    }
+
+    # Concurrent fault lists stored in DFF states
+    #
+    # Example:
+    # dff_fault_states['Q'] =
+    # {
+    #     'A/SA0': 'D',
+    #     'Q/SA1': 'B'
+    # }
+    #
+    dff_fault_states = {
+        q: {} for q in dff_outputs
+    }
+
+    fault_set = set(fault_list_to_simulate)
+
+    # ------------------------------------------------------------
+    # Detection information
+    # ------------------------------------------------------------
+    detection_map = {
+        fault: {
+            'detected': False,
+            'by_vector': None,
+            'first_level': None
+        }
+        for fault in fault_list_to_simulate
+    }
+
     detected_faults = set()
-    fault_detection_info = {}
-    T = len(test_vectors)
 
-    print("\nSTAGE 6 (time-expanded): SEQUENTIAL FAULT SIMULATION (5-valued)")
+    total_faults = len(fault_list_to_simulate)
+    total_vectors = len(test_vectors)
+
+    print("\nSTAGE 6: CONCURRENT FAULT SIMULATION (5-valued, on COLLAPSED fault list)")
     print(f"Total faults to simulate: {total_faults}")
-    print(f"Total time frames       : {T}")
+    print(f"Total time frames       : {total_vectors}")
 
-    for idx, fault in enumerate(full_fault_list, start=1):
-        net_fault, stuck = parse_fault(fault)
-        stuck_symbol = VAL1 if stuck == 1 else VAL0
+    # ============================================================
+    # VECTOR LOOP
+    #
+    # This is the important change.
+    #
+    # V1 -> all faults
+    # V2 -> all remaining faults
+    # V3 -> all remaining faults
+    # ...
+    # ============================================================
+    for vector_number, vector in enumerate(test_vectors, start=1):
 
-        detected = False
-        first_detect_frame = None
-        first_change_level = None
+        # ========================================================
+        # 1. SIMULATE GOOD CIRCUIT
+        # ========================================================
+        good = {}
 
-        dff_gates = [g for g in circuit['gates'] if g['type'].lower() == 'dff']
-        dff_outs = [g['output'] for g in dff_gates]
-        golden_states = {out: 0 for out in dff_outs}
-        faulty_states = {out: VAL0 for out in dff_outs}
+        # Primary inputs
+        for pin in circuit['inputs']:
+            good[pin] = int(vector.get(pin, 0))
 
-        for t in range(T):
-            vec = test_vectors[t]
-            # golden netvals (binary) - use existing precomputed if available
-            golden_netvals = {}
-            for p in circuit['inputs']:
-                golden_netvals[p] = int(vec.get(p, 0))
-            for dout in dff_outs:
-                golden_netvals[dout] = int(golden_states.get(dout, 0))
-            # evaluate golden combinational (binary) to fill internal nets (cheap pass)
-            temp_bin = dict(golden_netvals)
-            for g in sorted_gates:
-                gt = g['type'].lower()
-                out = g['output']
-                ins = g['inputs']
-                if gt == 'dff':
-                    clk_names = {'clk','clock','clkin'}
-                    dnet = None
-                    for n in ins:
-                        if n.lower() not in clk_names:
-                            dnet = n; break
-                    if dnet is None and ins:
-                        dnet = ins[-1]
-                    if dnet:
-                        temp_bin[f"{out}_D_input"] = int(temp_bin.get(dnet, 0))
+        # Current good DFF states
+        for q in dff_outputs:
+            good[q] = good_dff_states[q]
+
+        # Evaluate circuit in topological order
+        for gate in sorted_gates:
+
+            gate_type = gate['type'].lower()
+            output = gate['output']
+            inputs = gate['inputs']
+
+            # DFF
+            if gate_type == 'dff':
+
+                d_net = next(
+                    (
+                        n for n in inputs
+                        if n.lower()
+                        not in {'clk', 'clock', 'clkin'}
+                    ),
+                    inputs[-1] if inputs else None
+                )
+
+                if d_net is not None:
+                    good[f"{output}_D_input"] = \
+                        good.get(d_net, 0)
+
+                continue
+
+            input_values = [
+                good.get(n, 0)
+                for n in inputs
+            ]
+
+            good[output] = eval_gate(
+                gate_type,
+                input_values
+            )
+
+        # ========================================================
+        # 2. CREATE CONCURRENT FAULT LISTS
+        #
+        # fault_lists[net] =
+        #       {fault : faulty_value}
+        #
+        # Only faults currently affecting a net are stored.
+        # ========================================================
+        fault_lists = {}
+
+        # --------------------------------------------------------
+        # Primary-input faults
+        # --------------------------------------------------------
+        for pin in circuit['inputs']:
+
+            good_value = good[pin]
+
+            for sa_value in [0, 1]:
+
+                fault = f"{pin}/SA{sa_value}"
+
+                if fault not in fault_set:
                     continue
-                invals = [int(temp_bin.get(n, 0)) for n in ins]
-                try:
-                    newb = int(eval_gate(gt, invals))
-                except Exception:
-                    newb = 0
-                temp_bin[out] = newb
-            # prepare faulty 5-valued netvals
-            faulty_netvals = {}
-            for p in circuit['inputs']:
-                v = VAL1 if int(vec.get(p,0)) else VAL0
-                if p == net_fault: v = stuck_symbol
-                faulty_netvals[p] = v
-            for dout in dff_outs:
-                faulty_netvals[dout] = faulty_states.get(dout, VAL0)
-            # evaluate combinational in 5-valued domain
-            for g in sorted_gates:
-                gtype = g['type'].lower()
-                out = g['output']
-                ins = g['inputs']
-                in_vals_faulty = []
-                for n in ins:
-                    if n == net_fault:
-                        in_vals_faulty.append(stuck_symbol)
+
+                # If stuck value is same as good value,
+                # the fault is currently masked.
+                if sa_value == good_value:
+                    continue
+
+                # Convert to D/B notation.
+                #
+                # good=1, faulty=0 -> D
+                # good=0, faulty=1 -> B
+                faulty_symbol = (
+                    VALD if good_value == 1 else VALB
+                )
+
+                fault_lists.setdefault(pin, {})[
+                    fault
+                ] = faulty_symbol
+
+        # --------------------------------------------------------
+        # Faulty DFF states enter the current vector
+        # --------------------------------------------------------
+        for q in dff_outputs:
+
+            if dff_fault_states[q]:
+                fault_lists[q] = dict(
+                    dff_fault_states[q]
+                )
+
+            # Stuck-at faults physically located on Q
+            q_sa0 = f"{q}/SA0"
+            q_sa1 = f"{q}/SA1"
+
+            if (
+                q_sa0 in fault_set
+                and good[q] != 0
+            ):
+                fault_lists.setdefault(q, {})[
+                    q_sa0
+                ] = VALD
+
+            if (
+                q_sa1 in fault_set
+                and good[q] != 1
+            ):
+                fault_lists.setdefault(q, {})[
+                    q_sa1
+                ] = VALB
+
+        # ========================================================
+        # 3. CONCURRENT FAULT PROPAGATION
+        #
+        # Each gate receives:
+        #
+        #   good input values
+        #   + concurrent fault list
+        #
+        # All active faults are propagated at the same time
+        # conceptually through the gate.
+        # ========================================================
+        for gate in sorted_gates:
+
+            gate_type = gate['type'].lower()
+            output = gate['output']
+            inputs = gate['inputs']
+
+            # ----------------------------------------------------
+            # DFF
+            # ----------------------------------------------------
+            if gate_type == 'dff':
+
+                d_net = next(
+                    (
+                        n for n in inputs
+                        if n.lower()
+                        not in {'clk', 'clock', 'clkin'}
+                    ),
+                    inputs[-1] if inputs else None
+                )
+
+                if d_net is not None:
+
+                    # Faults on D become faults on Q
+                    # in the next time frame.
+                    fault_lists[
+                        f"{output}_D_input"
+                    ] = dict(
+                        fault_lists.get(d_net, {})
+                    )
+
+                continue
+
+            # ----------------------------------------------------
+            # Find all faults currently affecting any input
+            # ----------------------------------------------------
+            active_faults = set()
+
+            for net in inputs:
+                active_faults.update(
+                    fault_lists.get(net, {}).keys()
+                )
+
+            # ----------------------------------------------------
+            # A fault located at the gate output is introduced here
+            # ----------------------------------------------------
+            output_sa0 = f"{output}/SA0"
+            output_sa1 = f"{output}/SA1"
+
+            if output_sa0 in fault_set:
+                active_faults.add(output_sa0)
+
+            if output_sa1 in fault_set:
+                active_faults.add(output_sa1)
+
+            if not active_faults:
+                continue
+
+            output_fault_list = {}
+
+            good_output = good.get(output, 0)
+
+            # ----------------------------------------------------
+            # Propagate each entry of the concurrent fault list
+            # ----------------------------------------------------
+            for fault in active_faults:
+
+                fault_net, stuck_value = parse_fault(fault)
+
+                stuck_symbol = (
+                    VAL1 if stuck_value == 1
+                    else VAL0
+                )
+
+                faulty_inputs = []
+
+                for net in inputs:
+
+                    # If this particular fault is present
+                    # on the input, use its faulty value.
+                    if fault in fault_lists.get(net, {}):
+
+                        faulty_inputs.append(
+                            fault_lists[net][fault]
+                        )
+
                     else:
-                        in_vals_faulty.append(faulty_netvals.get(n, VAL0))
-                if gtype == 'dff':
-                    clk_names = {'clk','clock','clkin'}
-                    d_val = VALX
-                    for n in ins:
-                        if n.lower() not in clk_names:
-                            d_val = faulty_netvals.get(n, VAL0) if n != net_fault else stuck_symbol
-                            break
-                    if d_val == VALX and ins:
-                        n = ins[-1]
-                        d_val = faulty_netvals.get(n, VAL0) if n != net_fault else stuck_symbol
-                    faulty_netvals[f"{out}_D_input"] = d_val
-                    continue
-                new_val = eval_gate_5val(gtype, in_vals_faulty)
-                if out == net_fault:
-                    new_val = stuck_symbol
-                faulty_netvals[out] = new_val
-            # compare primary outputs for detection
-            po_diff = False
-            for po in circuit['outputs']:
-                golden_po = int(temp_bin.get(po, 0))
-                faulty_po = faulty_netvals.get(po, VAL0)
-                if faulty_po == VALD:
-                    if golden_po == 1:
-                        po_diff = True
-                elif faulty_po == VALB:
-                    if golden_po == 0:
-                        po_diff = True
-                elif faulty_po == VALX:
-                    # conservative: do not mark detection on X alone
-                    pass
+
+                        # Otherwise use the fault-free value.
+                        faulty_inputs.append(
+                            VAL1 if good.get(net, 0)
+                            else VAL0
+                        )
+
+                # Evaluate faulty circuit
+                faulty_output = eval_gate_5val(
+                    gate_type,
+                    faulty_inputs
+                )
+
+                # ------------------------------------------------
+                # Fault physically located at gate output
+                # ------------------------------------------------
+                if fault_net == output:
+                    faulty_output = stuck_symbol
+
+                    # Convert the output to D/B representation
+                    if faulty_output != (
+                        VAL1 if good_output else VAL0
+                    ):
+                        faulty_output = (
+                            VALD
+                            if good_output == 1
+                            else VALB
+                        )
+
+                # ------------------------------------------------
+                # Keep fault only if it differs from good circuit
+                # ------------------------------------------------
+                if faulty_output == VALX:
+
+                    output_fault_list[fault] = VALX
+
                 else:
-                    fbin = 1 if faulty_po == VAL1 else 0
-                    if fbin != golden_po:
-                        po_diff = True
-                if po_diff:
-                    break
-            if po_diff:
-                detected = True
-                first_detect_frame = t + 1
-                # approximate first_change_level by scanning D/DB net positions
-                min_level = None
-                for netname, v in faulty_netvals.items():
-                    if v in (VALD, VALB):
-                        if netname.endswith('_D_input'):
-                            outnet = netname[:-len('_D_input')]
-                            glev = next((g.get('level') for g in sorted_gates if g['output']==outnet), None)
-                        else:
-                            glev = next((g.get('level') for g in sorted_gates if g['output']==netname), None)
-                        if glev is not None:
-                            if min_level is None or glev < min_level:
-                                min_level = glev
-                first_change_level = min_level
-                break
-            # update golden and faulty DFF states for next frame
-            next_golden_states = {}
-            for g in dff_gates:
-                out = g['output']
-                next_golden_states[out] = int(temp_bin.get(f"{out}_D_input", golden_states.get(out, 0)))
-            golden_states = next_golden_states
-            next_faulty_states = {}
-            for out in dff_outs:
-                next_faulty_states[out] = faulty_netvals.get(f"{out}_D_input", faulty_states.get(out, VAL0))
-            faulty_states = next_faulty_states
 
-        if detected:
-            detected_faults.add(fault)
-            fault_detection_info[fault] = {'detected': True, 'by_vector': first_detect_frame, 'first_level': first_change_level}
-        else:
-            fault_detection_info[fault] = {'detected': False, 'by_vector': None, 'first_level': None}
+                    if faulty_output == VALD:
+                        faulty_bit = 0
 
-        if idx % 100 == 0 or idx == total_faults:
-            print(f"Simulated {idx}/{total_faults} faults... detected so far: {len(detected_faults)}")
+                    elif faulty_output == VALB:
+                        faulty_bit = 1
 
+                    else:
+                        faulty_bit = (
+                            1 if faulty_output == VAL1
+                            else 0
+                        )
+
+                    # Fault is propagated only if observable at
+                    # this point.
+                    if faulty_bit != good_output:
+
+                        output_fault_list[fault] = (
+                            VALD
+                            if good_output == 1
+                            else VALB
+                        )
+
+            # ----------------------------------------------------
+            # Update concurrent fault list of this gate
+            # ----------------------------------------------------
+            if output_fault_list:
+                fault_lists[output] = output_fault_list
+            else:
+                fault_lists.pop(output, None)
+
+        # ========================================================
+        # 4. FAULT DETECTION
+        #
+        # If a fault reaches a primary output as D/B, it is detected.
+        # ========================================================
+        for primary_output in circuit['outputs']:
+
+            output_faults = fault_lists.get(
+                primary_output,
+                {}
+            )
+
+            for fault, value in output_faults.items():
+
+                if fault in detected_faults:
+                    continue
+
+                if value in (VALD, VALB):
+
+                    detected_faults.add(fault)
+
+                    detection_map[fault] = {
+                        'detected': True,
+                        'by_vector': vector_number,
+                        'first_level': next(
+                            (
+                                g.get('level')
+                                for g in sorted_gates
+                                if g['output']
+                                == primary_output
+                            ),
+                            None
+                        )
+                    }
+
+        # ========================================================
+        # 5. UPDATE DFF STATES
+        # ========================================================
+        next_good_states = {}
+        next_fault_states = {}
+
+        for gate in dff_gates:
+
+            q = gate['output']
+
+            # Good Q for next vector
+            next_good_states[q] = int(
+                good.get(
+                    f"{q}_D_input",
+                    good_dff_states[q]
+                )
+            )
+
+            # Faults propagated from D to Q
+            next_fault_states[q] = dict(
+                fault_lists.get(
+                    f"{q}_D_input",
+                    {}
+                )
+            )
+
+            # A stuck-at fault on Q persists
+            q_sa0 = f"{q}/SA0"
+            q_sa1 = f"{q}/SA1"
+
+            if (
+                q_sa0 in fault_set
+                and next_good_states[q] != 0
+            ):
+                next_fault_states[q][q_sa0] = VALD
+
+            if (
+                q_sa1 in fault_set
+                and next_good_states[q] != 1
+            ):
+                next_fault_states[q][q_sa1] = VALB
+
+        good_dff_states = next_good_states
+        dff_fault_states = next_fault_states
+
+        print(
+            f"Processed vector {vector_number}/{total_vectors}; "
+            f"faults detected so far: "
+            f"{len(detected_faults)}"
+        )
+
+    # ============================================================
+    # FINAL STATISTICS
+    # ============================================================
     total_detected = len(detected_faults)
-    pct = (100.0 * total_detected / total_faults) if total_faults else 0.0
-    print("\nSTAGE 6 (time-expanded) SUMMARY")
-    print(f"Total faults simulated : {total_faults}")
-    print(f"Detected faults        : {total_detected}")
-    print(f"Detection percentage   : {pct:.2f}%")
-    sample_detected = list(detected_faults)[:verbose_sample]
-    sample_undetected = [f for f, info in fault_detection_info.items() if not info['detected']][:verbose_sample]
-    if sample_detected:
-        print("Sample detected faults (fault -> frame, first_change_level):")
-        for f in sample_detected:
-            info = fault_detection_info[f]
-            print(f"  {f} -> frame #{info['by_vector']}, first_level={info['first_level']}")
-    if sample_undetected:
+
+    detection_percentage = (
+        100.0 * total_detected / total_faults
+        if total_faults else 0.0
+    )
+
+    print(
+        "\nSTAGE 6 CONCURRENT FAULT SIMULATION SUMMARY"
+    )
+
+    print(
+        f"Total faults simulated (collapsed list) : "
+        f"{total_faults}"
+    )
+
+    print(
+        f"Detected faults        : "
+        f"{total_detected}"
+    )
+
+    print(
+        f"Detection percentage   : "
+        f"{detection_percentage:.2f}%"
+    )
+
+    print(
+        "\nSample detected faults "
+        "(fault -> frame, first_change_level):"
+    )
+
+    for fault in list(detected_faults)[:verbose_sample]:
+
+        info = detection_map[fault]
+
+        print(
+            f"  {fault} -> frame "
+            f"#{info['by_vector']}, "
+            f"first_level={info['first_level']}"
+        )
+
+    undetected = [
+        f for f in fault_list_to_simulate
+        if f not in detected_faults
+    ]
+
+    if undetected:
+
         print("\nSample undetected faults:")
-        for f in sample_undetected:
-            print(f"  {f}")
-    return fault_detection_info
+
+        for fault in undetected[:verbose_sample]:
+            print(f"  {fault}")
+
+    return detection_map
 
 # ----------------------
 # STEP 7: WRITE RESULTS
 # ----------------------
 
-def write_results_to_file(circuit, faults_info, detection_map, sorted_gates, filename="Result.txt"):
+def write_results_to_file(circuit, faults_info, detection_map, sorted_gates, filename="Result.txt",
+                           full_detected=None, full_undetected=None):
     # Append a timestamped run block so results from multiple GUI runs stack in the same file.
     with open(filename, 'a') as f:
         f.write("\n" + "="*80 + "\n")
@@ -662,13 +1095,25 @@ def write_results_to_file(circuit, faults_info, detection_map, sorted_gates, fil
         f.write("Sample faults (first 20):" + str(faults_info['full'][:20]) + "\n")
         f.write(f"After equivalence collapsing  : {len(faults_info['eq_collapsed'])}\n")
         f.write(f"After dominance collapsing    : {len(faults_info['dom_collapsed'])}\n")
-        f.write(f"Sample faults after dominance collapsing    : {faults_info['dom_collapsed'][:20]}\n\n")
+        f.write(f"Sample faults after dominance collapsing    : {faults_info['dom_collapsed'][:20]}\n")
+        if faults_info['full']:
+            reduction = 100.0 * (len(faults_info['full']) - len(faults_info['dom_collapsed'])) / len(faults_info['full'])
+            f.write(f"Simulation workload reduction from collapsing: {reduction:.1f}% "
+                    f"({len(faults_info['full'])} -> {len(faults_info['dom_collapsed'])} faults actually simulated)\n\n")
+        else:
+            f.write("\n")
         detected = [f for f, d in detection_map.items() if d['detected']]
         undetected = [f for f, d in detection_map.items() if not d['detected']]
-        f.write("FAULT SIMULATION SUMMARY\n")
+        f.write("FAULT SIMULATION SUMMARY (on collapsed fault list)\n")
         f.write(f"Detected faults   : {len(detected)}\n")
         f.write(f"Undetected faults : {len(undetected)}\n")
         f.write(f"Detection Rate    : {100.0 * len(detected)/len(detection_map):.2f}%\n\n")
+        if full_detected is not None and full_undetected is not None:
+            full_total = len(full_detected) + len(full_undetected)
+            f.write("FULL-LIST FAULT COVERAGE (back-annotated from collapsed results)\n")
+            f.write(f"Detected (full list)   : {len(full_detected)}/{full_total}\n")
+            f.write(f"Full-list coverage      : {100.0*len(full_detected)/full_total:.2f}% "
+                    f"(lower bound where dominance links are unresolved)\n\n")
         f.write("SAMPLE DETECTED FAULTS:\n")
         for f_name in detected[:10]:
             info = detection_map[f_name]
@@ -807,13 +1252,31 @@ class FaultSimulatorGUI(QWidget):
 
             # Stage 5
             faults_info = generate_and_collapse_faults(circuit)
-            full_faults = faults_info['full']
+
+            # ---- FIX: simulate the COLLAPSED fault list, not the full one ----
+            # This is the whole point of doing fault collapsing: every fault
+            # removed by equivalence/dominance collapsing is detected by the
+            # same vectors as the representative fault it collapsed into, so
+            # only the survivors (faults_info['dom_collapsed']) need to be
+            # explicitly propagated through the circuit in Stage 6.
+            faults_to_simulate = faults_info['dom_collapsed']
 
             # Stage 6
-            detection_map = fault_simulation_serial(full_faults, circuit, sorted_gates, sim_results, test_vectors)
+            detection_map = fault_simulation_concurrent(faults_to_simulate, circuit, sorted_gates, sim_results, test_vectors)
+
+            # Stage 6b - expand collapsed-list results back onto the full fault list
+            full_detected, full_undetected = expand_coverage_to_full_list(faults_info, detection_map)
+            full_total = len(full_detected) + len(full_undetected)
+            print("\nSTAGE 6b: FULL-LIST FAULT COVERAGE (back-annotated from collapsed results)")
+            print(f"Collapsed fault coverage : {100.0*len([f for f,d in detection_map.items() if d['detected']])/len(detection_map):.2f}% "
+                  f"({len(detection_map)} faults simulated)")
+            print(f"Full-list fault coverage : {100.0*len(full_detected)/full_total:.2f}% "
+                  f"({len(full_detected)}/{full_total} of all {len(faults_info['full'])} original faults; "
+                  f"lower bound where dominance links are unresolved)")
 
             # Stage 7 - append to Result.txt
-            write_results_to_file(circuit, faults_info, detection_map, sorted_gates, filename="Result.txt")
+            write_results_to_file(circuit, faults_info, detection_map, sorted_gates, filename="Result.txt",
+                                   full_detected=full_detected, full_undetected=full_undetected)
 
             print("\nSimulation complete. Results appended to 'Result.txt'.\n")
 
